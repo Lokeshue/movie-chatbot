@@ -4,24 +4,40 @@ import datetime as dt
 import requests
 import streamlit as st
 
+# -----------------------------
+# Config
+# -----------------------------
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 TMDB_BASE = "https://api.themoviedb.org/3"
 
-# Indian languages on TMDB:
-# hi (Hindi), ta (Tamil), te (Telugu), ml (Malayalam), kn (Kannada)
-INDIAN_LANG_CODES = ["hi", "ta", "te", "ml", "kn"]
+INDIAN_LANG_CODES = ["hi", "ta", "te", "ml", "kn"]  # Hindi, Tamil, Telugu, Malayalam, Kannada
+GLOBAL_REGIONS = ["US", "KR", "JP", "FR", "ES"]     # for variety
 
+SKIP_WORDS = {"skip", "idk", "i don't know", "dont know", "random", "surprise me", ""}
 
+# -----------------------------
+# TMDB helpers
+# -----------------------------
 def tmdb_get(path, params=None):
     if not TMDB_API_KEY:
-        raise RuntimeError("Missing TMDB_API_KEY environment variable.")
+        raise RuntimeError("TMDB_API_KEY is missing. Set it in Streamlit Secrets or export locally.")
     params = params or {}
     params["api_key"] = TMDB_API_KEY
     r = requests.get(f"{TMDB_BASE}{path}", params=params, timeout=20)
-    r.raise_for_status()
+
+    # Streamlit Cloud redacts errors; show safe status
+    if r.status_code != 200:
+        try:
+            payload = r.json()
+            msg = payload.get("status_message", r.text[:200])
+        except Exception:
+            msg = r.text[:200]
+        raise RuntimeError(f"TMDB API error {r.status_code}: {msg}")
+
     return r.json()
 
 
+@st.cache_data(show_spinner=False)
 def get_genre_map():
     data = tmdb_get("/genre/movie/list", {"language": "en-US"})
     return {g["name"].lower(): g["id"] for g in data.get("genres", [])}
@@ -36,30 +52,16 @@ def search_person_id(name: str):
     return results[0]["id"] if results else None
 
 
-def discover_movies(
-    *,
-    start_date: str,
-    end_date: str,
-    page: int = 1,
-    genre_id: int | None = None,
-    with_original_language: str | None = None,
-    region: str | None = None,
-    sort_by: str = "popularity.desc",
-):
-    """
-    TMDB Discover endpoint.
-    We keep date range locked to last 20 years.
-    We also add a small vote_count filter so results aren't too "new/empty".
-    """
+def discover_movies(*, start_date, end_date, page=1, genre_id=None, with_original_language=None, region=None):
     params = {
         "include_adult": "false",
         "include_video": "false",
         "language": "en-US",
-        "sort_by": sort_by,
+        "sort_by": "popularity.desc",
         "page": page,
         "primary_release_date.gte": start_date,
         "primary_release_date.lte": end_date,
-        "vote_count.gte": 50,  # helps reduce extremely new / low-info movies
+        "vote_count.gte": 50,  # avoids super-new / low-signal items
     }
     if genre_id:
         params["with_genres"] = genre_id
@@ -67,7 +69,6 @@ def discover_movies(
         params["with_original_language"] = with_original_language
     if region:
         params["region"] = region
-
     return tmdb_get("/discover/movie", params)
 
 
@@ -101,7 +102,7 @@ def unique_movies(movies):
     return out
 
 
-def year_from_date(d: str) -> int | None:
+def year_from_date(d: str):
     if not d:
         return None
     try:
@@ -110,14 +111,8 @@ def year_from_date(d: str) -> int | None:
         return None
 
 
-def balanced_sample_by_year(movies, n: int) -> list:
-    """
-    Avoid getting only 2025/2024 by sampling across years.
-    Simple approach:
-    - group by year
-    - shuffle each year
-    - round-robin pick across years (most recent to older)
-    """
+def balanced_sample_by_year(movies, n: int):
+    """Round-robin across years so you don't only get 2025/2024."""
     movies = unique_movies(movies)
     buckets = {}
     for m in movies:
@@ -137,124 +132,195 @@ def balanced_sample_by_year(movies, n: int) -> list:
     picked = []
     idx = 0
     while len(picked) < n:
-        made_progress = False
+        progressed = False
         for y in years:
             if idx < len(buckets[y]):
                 picked.append(buckets[y][idx])
-                made_progress = True
+                progressed = True
                 if len(picked) >= n:
                     break
-        if not made_progress:
+        if not progressed:
             break
         idx += 1
 
     return picked[:n]
 
 
-def label_movie(m, indian_lang_set):
+def label_movie(m):
     lang = (m.get("original_language") or "").lower()
-    return "🇮🇳 Indian" if lang in indian_lang_set else "🌍 Global"
+    return "🇮🇳 Indian" if lang in set(INDIAN_LANG_CODES) else "🌍 Global"
 
 
-def main():
-    st.set_page_config(page_title="Movie Reco Chatbot", page_icon="🎬", layout="centered")
-    st.title("🎬 Movie Recommendation Chatbot ")
-    st.caption("Leave blank or type 'surprise me'. Recommendations are from the last 20 years.")
+# -----------------------------
+# Chat state machine
+# -----------------------------
+QUESTIONS = [
+    ("fav_movie", "Tell me one movie you love (or type **skip**)."),
+    ("fav_actor", "Who’s your favorite hero/actor? (or **skip**)"),
+    ("fav_song", "Any favorite movie song? (or **skip**)"),
+    ("genre", "Pick a genre (Action / Comedy / Romance / Thriller / Sci-Fi / Horror / Drama) or type anything (or **skip**)."),
+    ("mix", "Do you want **more Indian**, **more global**, or **50-50**? (default: 50-50)"),
+]
 
-    if not TMDB_API_KEY:
-        st.error("TMDB_API_KEY is not set. In terminal: export TMDB_API_KEY='YOUR_KEY'")
-        st.stop()
+def normalize_answer(text: str) -> str:
+    t = (text or "").strip()
+    if t.lower() in SKIP_WORDS:
+        return ""
+    return t
 
+def infer_mix(text: str) -> str:
+    t = (text or "").lower().strip()
+    if "ind" in t:
+        return "more_indian"
+    if "glob" in t or "holly" in t or "other" in t:
+        return "more_global"
+    return "50_50"
+
+def build_recommendations(prefs, count=10):
     today = dt.date.today()
     start_20yrs = today.replace(year=today.year - 20).isoformat()
     end_today = today.isoformat()
 
     genre_map = get_genre_map()
-    indian_lang_set = set(INDIAN_LANG_CODES)
+    genre_text = (prefs.get("genre") or "").lower().strip()
+    genre_id = genre_map.get(genre_text) if genre_text else None
 
-    st.subheader("🗣️ Questions")
-    fav_movie = st.text_input("1) Favorite movie (optional)", placeholder="Interstellar / Vikram / surprise me")
-    fav_actor = st.text_input("2) Favorite hero/actor (optional)", placeholder="Vijay / Suriya / Shah Rukh Khan / Leonardo DiCaprio")
-    fav_song = st.text_input("3) Favorite movie song (optional)", placeholder="Naatu Naatu / Arabic Kuthu / surprise me")
-    genre = st.text_input("4) Favorite genre (optional)", placeholder="Action, Comedy, Romance, Thriller, Sci-Fi...")
+    mix_pref = prefs.get("mix", "50_50")
+    if mix_pref not in {"50_50", "more_indian", "more_global"}:
+        mix_pref = "50_50"
 
-    count = st.slider("How many recommendations?", 6, 20, 10)
-    st.caption("We’ll do roughly half Indian + half Global.")
+    # Pull Indian pool (multi-language)
+    indian_pool = []
+    for lang in INDIAN_LANG_CODES:
+        for p in range(1, 3):
+            data = discover_movies(
+                start_date=start_20yrs, end_date=end_today, page=p,
+                genre_id=genre_id, with_original_language=lang
+            )
+            indian_pool.extend(data.get("results", []))
 
-    if st.button("Get Recommendations 🍿"):
-        def normalize(x):
-            x = (x or "").strip()
-            return "" if x.lower() in ["surprise me", "idk", "i don't know", "dont know", "random"] else x
+    # Pull global pool (by regions for variety), then exclude Indian languages
+    global_pool = []
+    for region in GLOBAL_REGIONS:
+        for p in range(1, 3):
+            data = discover_movies(
+                start_date=start_20yrs, end_date=end_today, page=p,
+                genre_id=genre_id, region=region
+            )
+            global_pool.extend(data.get("results", []))
 
-        fav_movie = normalize(fav_movie)
-        fav_actor = normalize(fav_actor)
-        fav_song = normalize(fav_song)
-        genre = normalize(genre)
+    indian_set = set(INDIAN_LANG_CODES)
+    global_pool = [m for m in global_pool if (m.get("original_language") or "").lower() not in indian_set]
 
-        genre_id = genre_map.get(genre.lower()) if genre else None
+    # Actor boost (optional)
+    fav_actor = prefs.get("fav_actor", "")
+    if fav_actor:
+        pid = search_person_id(fav_actor)
+        if pid:
+            actor_movies = movies_by_actor(pid, start_20yrs, end_today, pages=3)
+            indian_pool.extend([m for m in actor_movies if (m.get("original_language") or "").lower() in indian_set])
+            global_pool.extend([m for m in actor_movies if (m.get("original_language") or "").lower() not in indian_set])
 
-        # 1) Pull Indian pool (mix multiple Indian languages)
-        indian_pool = []
-        for lang in INDIAN_LANG_CODES:
-            for p in range(1, 3):  # 2 pages per language
-                data = discover_movies(
-                    start_date=start_20yrs,
-                    end_date=end_today,
-                    page=p,
-                    genre_id=genre_id,
-                    with_original_language=lang,
-                )
-                indian_pool.extend(data.get("results", []))
+    # Decide mix ratio
+    if mix_pref == "more_indian":
+        ind_n = int(round(count * 0.7))
+    elif mix_pref == "more_global":
+        ind_n = int(round(count * 0.3))
+    else:  # 50-50
+        ind_n = count // 2
+    glob_n = count - ind_n
 
-        # 2) Pull global pool (use region-based discovery for variety)
-        # NOTE: We intentionally do NOT use without_original_language because it can be inconsistent.
-        # Instead we fetch global lists from different regions and later filter out Indian languages.
-        global_pool = []
-        for region in ["US", "KR", "JP", "FR", "ES"]:
-            for p in range(1, 3):
-                data = discover_movies(
-                    start_date=start_20yrs,
-                    end_date=end_today,
-                    page=p,
-                    genre_id=genre_id,
-                    region=region,
-                )
-                global_pool.extend(data.get("results", []))
+    indian_pick = balanced_sample_by_year(indian_pool, ind_n)
+    global_pick = balanced_sample_by_year(global_pool, glob_n)
 
-        # Filter global pool to exclude Indian languages
-        global_pool = [m for m in global_pool if (m.get("original_language") or "").lower() not in indian_lang_set]
+    final = unique_movies(indian_pick + global_pick)
+    return final[:count]
 
-        # 3) If actor provided, boost (add actor movies into both pools)
-        if fav_actor:
-            pid = search_person_id(fav_actor)
-            if pid:
-                actor_movies = movies_by_actor(pid, start_20yrs, end_today, pages=3)
-                indian_pool.extend([m for m in actor_movies if (m.get("original_language") or "").lower() in indian_lang_set])
-                global_pool.extend([m for m in actor_movies if (m.get("original_language") or "").lower() not in indian_lang_set])
 
-        # 4) Balanced sampling to avoid only 2025/2024
-        half = count // 2
-        indian_pick = balanced_sample_by_year(indian_pool, half)
-        global_pick = balanced_sample_by_year(global_pool, count - half)
+# -----------------------------
+# Streamlit UI (chat)
+# -----------------------------
+st.set_page_config(page_title="Movie Chatbot", page_icon="🎬", layout="centered")
+st.title("🎬 Movie Recommendation Chatbot")
+st.caption("Chat with me. Type **skip** anytime. I’ll recommend movies from the last 20 years.")
 
-        final = unique_movies(indian_pick + global_pick)
+# Init session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "prefs" not in st.session_state:
+    st.session_state.prefs = {}
+if "q_index" not in st.session_state:
+    st.session_state.q_index = 0
+if "done" not in st.session_state:
+    st.session_state.done = False
 
-        st.subheader("✅ Recommendations")
-        for m in final[:count]:
+# If first load, bot greets + asks first question
+if len(st.session_state.messages) == 0:
+    st.session_state.messages.append({"role": "assistant", "content": "Hi! I’ll ask a few quick questions and then recommend movies 🍿"})
+    st.session_state.messages.append({"role": "assistant", "content": QUESTIONS[0][1]})
+
+# Render chat history
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# Chat input
+user_text = st.chat_input("Type your answer… (or 'skip')")
+
+if user_text is not None and user_text.strip() != "":
+    # show user message
+    st.session_state.messages.append({"role": "user", "content": user_text})
+
+    # If already done, allow "again" or "reset"
+    if st.session_state.done:
+        cmd = user_text.strip().lower()
+        if cmd in {"reset", "start over", "restart"}:
+            st.session_state.messages.append({"role": "assistant", "content": "Cool — starting over."})
+            st.session_state.prefs = {}
+            st.session_state.q_index = 0
+            st.session_state.done = False
+            st.session_state.messages.append({"role": "assistant", "content": QUESTIONS[0][1]})
+            st.rerun()
+        else:
+            st.session_state.messages.append({"role": "assistant", "content": "Type **reset** to start over, or share more preferences (actor/genre) and I’ll tune it."})
+            st.rerun()
+
+    # store answer for current question
+    key, _question = QUESTIONS[st.session_state.q_index]
+    ans = normalize_answer(user_text)
+
+    if key == "mix":
+        st.session_state.prefs[key] = infer_mix(ans) if ans else "50_50"
+    else:
+        st.session_state.prefs[key] = ans
+
+    # move to next question or recommend
+    st.session_state.q_index += 1
+
+    if st.session_state.q_index < len(QUESTIONS):
+        next_q = QUESTIONS[st.session_state.q_index][1]
+        st.session_state.messages.append({"role": "assistant", "content": next_q})
+        st.rerun()
+    else:
+        # Recommend
+        try:
+            recs = build_recommendations(st.session_state.prefs, count=10)
+        except Exception as e:
+            st.session_state.messages.append({"role": "assistant", "content": f"Oops — I couldn’t fetch recommendations. {e}"})
+            st.session_state.done = True
+            st.rerun()
+
+        # Build response text
+        lines = ["Here are your recommendations (last 20 years):"]
+        for m in recs:
             title = m.get("title", "Untitled")
             date = m.get("release_date", "")
-            rating = m.get("vote_average", "N/A")
-            overview = m.get("overview", "")
             year = date[:4] if date else "—"
-            tag = label_movie(m, indian_lang_set)
+            rating = m.get("vote_average", "N/A")
+            tag = label_movie(m)
+            lines.append(f"- **{title} ({year})** — {tag} — ⭐ {rating}")
 
-            st.markdown(f"### {title} ({year}) — {tag}")
-            st.write(f"⭐ Rating: {rating}")
-            if overview:
-                st.write(overview)
-
-        st.info("Tip: Try typing only a genre like 'Action' or just click without typing anything for a mixed surprise list.")
-
-
-if __name__ == "__main__":
-    main()
+        lines.append("\nIf you want a new list, type **reset**.")
+        st.session_state.messages.append({"role": "assistant", "content": "\n".join(lines)})
+        st.session_state.done = True
+        st.rerun()
